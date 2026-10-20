@@ -31,10 +31,19 @@ logger = get_logger()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifecycle: create tables on startup, cleanup on shutdown."""
+    """Application lifecycle: verify database connection on startup, cleanup on shutdown.
+
+    Database schema migrations are executed explicitly via Alembic (`alembic upgrade head`).
+    SQLAlchemy's create_all is avoided in production to prevent DDL race conditions
+    and ensure deterministic version-controlled schema evolution.
+    """
     logger.info("starting_up", database_url=settings.database_url.split("@")[-1])  # Don't log credentials
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    if settings.debug:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+    else:
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
     logger.info("database_ready")
     yield
     await engine.dispose()

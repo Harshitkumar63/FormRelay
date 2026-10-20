@@ -1,21 +1,22 @@
-"""Test configuration and fixtures."""
-
-import asyncio
+import os
+import tempfile
 import uuid
 
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from app.main import app
 from app.database import get_db
 from app.models import Base
 
-# Use an in-memory SQLite database for tests - isolated from dev data
-TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
+# Use an isolated temp SQLite database with NullPool to prevent event-loop lock inheritance
+TEST_DB_PATH = os.path.join(tempfile.gettempdir(), f"formrelay_test_{os.getpid()}.db")
+TEST_DATABASE_URL = f"sqlite+aiosqlite:///{TEST_DB_PATH}"
 
-test_engine = create_async_engine(TEST_DATABASE_URL, echo=False)
+test_engine = create_async_engine(TEST_DATABASE_URL, echo=False, poolclass=NullPool)
 test_session_factory = async_sessionmaker(
     test_engine, class_=AsyncSession, expire_on_commit=False
 )

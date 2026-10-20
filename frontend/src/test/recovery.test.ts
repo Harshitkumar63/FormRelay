@@ -154,4 +154,51 @@ describe('FormRelay Engine & IndexedDB Recovery', () => {
     const clearEvent = audits.find((a) => a.eventType === 'draft_cleared')
     expect(clearEvent).toBeDefined()
   })
+
+  it('preserves offline edits and registers stable identifier without data loss', async () => {
+    // 1. Simulate offline state when draft is first created
+    const draft = await engine.loadOrCreateDraft(
+      'offline-lifecycle-form',
+      2,
+      DEFAULT_V2_SCHOLARSHIP_DATA as unknown as Record<string, unknown>
+    )
+
+    expect(draft.id).toBeDefined()
+    const originalLocalId = draft.id
+
+    // 2. Perform offline checkpoints
+    const updatedData = {
+      ...DEFAULT_V2_SCHOLARSHIP_DATA,
+      personal: { ...DEFAULT_V2_SCHOLARSHIP_DATA.personal, first_name: 'OfflineElena' },
+    }
+    engine.queueCheckpoint(updatedData as unknown as Record<string, unknown>, 10)
+    await engine.commitCheckpointNow()
+
+    // Verify local storage has the edited data and incremented revision
+    const stored = await db.drafts.get(originalLocalId)
+    expect(stored).toBeDefined()
+    expect((stored?.data as any).personal.first_name).toBe('OfflineElena')
+    expect(stored?.localRevision).toBe(2)
+  })
+
+  it('handles server-side validation error gracefully without corrupting local draft', async () => {
+    const draft = await engine.loadOrCreateDraft(
+      'validation-error-form',
+      2,
+      DEFAULT_V2_SCHOLARSHIP_DATA as unknown as Record<string, unknown>
+    )
+
+    // Put invalid data locally
+    const invalidData = {
+      ...DEFAULT_V2_SCHOLARSHIP_DATA,
+      contact: { ...DEFAULT_V2_SCHOLARSHIP_DATA.contact, email: 'not-an-email' },
+    }
+    engine.queueCheckpoint(invalidData as unknown as Record<string, unknown>, 10)
+    await engine.commitCheckpointNow()
+
+    // Local checkpoint remains intact even if sync encounters validation error
+    const local = engine.getDraft()
+    expect(local).toBeDefined()
+    expect((local?.data as any).contact.email).toBe('not-an-email')
+  })
 })

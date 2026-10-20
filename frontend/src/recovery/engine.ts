@@ -145,7 +145,7 @@ export class FormRelayEngine {
     // 3. Register draft on backend if online
     if (this.networkStatus === 'online') {
       try {
-        const remote = await apiClient.createDraft(formId, schemaVersion, initialData)
+        const remote = await apiClient.createDraft(formId, schemaVersion, initialData, newDraft.id)
         newDraft.id = remote.id
         newDraft.serverRevision = remote.revision
         newDraft.baseRevision = remote.revision
@@ -235,6 +235,38 @@ export class FormRelayEngine {
     logLocalAudit('sync_started', 'Sync with backend started', this.currentDraft.id)
 
     try {
+      // If the draft was created offline and never registered on server, register it now
+      if (!this.currentDraft.lastSyncedAt) {
+        try {
+          const remote = await apiClient.createDraft(
+            this.currentDraft.formId,
+            this.currentDraft.schemaVersion,
+            this.currentDraft.data,
+            this.currentDraft.id
+          )
+          this.currentDraft.serverRevision = remote.revision
+          this.currentDraft.baseRevision = remote.revision
+          this.currentDraft.localRevision = remote.revision
+          this.currentDraft.syncStatus = 'synced'
+          this.currentDraft.isDirty = false
+          this.currentDraft.lastSyncedAt = new Date().toISOString()
+          this.currentDraft.lastSyncError = undefined
+          await db.drafts.put(this.currentDraft)
+          await db.syncQueue.where('draftId').equals(this.currentDraft.id).delete()
+          logLocalAudit('sync_succeeded', `Registered offline draft on server (ID ${remote.id})`, remote.id)
+          this.notify()
+          return
+        } catch (regErr: any) {
+          if (regErr.status !== 409) {
+            this.currentDraft.syncStatus = 'error'
+            this.currentDraft.lastSyncError = regErr.message || 'Offline draft registration failed'
+            await db.drafts.put(this.currentDraft)
+            this.notify()
+            return
+          }
+        }
+      }
+
       const syncResult = await apiClient.syncDraft(
         this.currentDraft.id,
         this.currentDraft.data,
@@ -255,6 +287,7 @@ export class FormRelayEngine {
         this.activeConflict = null
 
         await db.drafts.put(this.currentDraft)
+        await db.syncQueue.where('draftId').equals(this.currentDraft.id).delete()
         logLocalAudit(
           'sync_succeeded',
           `Successfully synced to server rev ${syncResult.server_revision}`,
@@ -262,7 +295,33 @@ export class FormRelayEngine {
         )
       }
     } catch (err: any) {
-      if (err.status === 409 && err.detail?.status === 'conflict') {
+      if (err.status === 404) {
+        // Draft not found on server — attempt offline registration recovery
+        try {
+          const remote = await apiClient.createDraft(
+            this.currentDraft.formId,
+            this.currentDraft.schemaVersion,
+            this.currentDraft.data,
+            this.currentDraft.id
+          )
+          this.currentDraft.serverRevision = remote.revision
+          this.currentDraft.baseRevision = remote.revision
+          this.currentDraft.localRevision = remote.revision
+          this.currentDraft.syncStatus = 'synced'
+          this.currentDraft.isDirty = false
+          this.currentDraft.lastSyncedAt = new Date().toISOString()
+          this.currentDraft.lastSyncError = undefined
+          await db.drafts.put(this.currentDraft)
+          await db.syncQueue.where('draftId').equals(this.currentDraft.id).delete()
+          logLocalAudit('sync_succeeded', `Recovered missing server draft (ID ${remote.id})`, remote.id)
+          this.notify()
+          return
+        } catch (regErr: any) {
+          this.currentDraft.syncStatus = 'error'
+          this.currentDraft.lastSyncError = regErr.message || 'Draft registration failed'
+          await db.drafts.put(this.currentDraft)
+        }
+      } else if (err.status === 409 && err.detail?.status === 'conflict') {
         // Revision Conflict!
         const detail = err.detail
         const analysis = analyze3WayMerge(
@@ -323,7 +382,8 @@ export class FormRelayEngine {
         strategy,
         resolvedData,
         this.activeConflict.serverRevision,
-        this.currentDraft.schemaVersion
+        this.currentDraft.schemaVersion,
+        this.activeConflict.clientBaseRevision
       )
 
       this.currentDraft.data = resp.data
@@ -352,6 +412,26 @@ export class FormRelayEngine {
   // --- Schema Migration ---
   async migrateCurrentDraft(toVersion: number): Promise<any> {
     if (!this.currentDraft) return
+
+    if (this.networkStatus === 'online' && this.currentDraft.lastSyncedAt) {
+      try {
+        const resp = await apiClient.migratePersistedDraft(this.currentDraft.id, toVersion)
+        this.currentDraft.schemaVersion = resp.schema_version
+        this.currentDraft.data = resp.data
+        this.currentDraft.localRevision = resp.revision
+        this.currentDraft.baseRevision = resp.revision
+        this.currentDraft.serverRevision = resp.revision
+        this.currentDraft.isDirty = false
+        this.currentDraft.syncStatus = 'synced'
+        this.currentDraft.lastSyncedAt = new Date().toISOString()
+        await db.drafts.put(this.currentDraft)
+        logLocalAudit('schema_migrated', `Migrated draft to v${toVersion} on server`, this.currentDraft.id)
+        this.notify()
+        return resp
+      } catch (e) {
+        console.warn('Server draft migration failed, falling back to local migration:', e)
+      }
+    }
 
     const migration = await apiClient.migrateSchema(
       this.currentDraft.data,

@@ -271,98 +271,133 @@ Defined in `.env.example`:
 
 ---
 
-## Automated Test Results
+## Architecture & Concurrency Model
 
-### Backend (Pytest): 23 Passed in 0.60s
-```
-tests/test_api.py::test_health PASSED                                    [  4%]
-tests/test_api.py::test_ready PASSED                                     [  8%]
-tests/test_api.py::test_create_draft PASSED                              [ 13%]
-tests/test_api.py::test_get_draft PASSED                                 [ 17%]
-tests/test_api.py::test_get_draft_wrong_owner PASSED                     [ 21%]
-tests/test_api.py::test_update_draft_success PASSED                      [ 26%]
-tests/test_api.py::test_update_draft_revision_conflict PASSED            [ 30%]
-tests/test_api.py::test_draft_not_found PASSED                           [ 34%]
-tests/test_api.py::test_missing_owner_token PASSED                       [ 39%]
-tests/test_api.py::test_sync_fast_forward PASSED                         [ 43%]
-tests/test_api.py::test_sync_conflict PASSED                             [ 47%]
-tests/test_api.py::test_sync_auto_merge PASSED                           [ 52%]
-tests/test_api.py::test_resolve_conflict PASSED                          [ 56%]
-tests/test_api.py::test_schema_migration_v1_to_v2 PASSED                 [ 60%]
-tests/test_api.py::test_schema_migration_same_version PASSED             [ 65%]
-tests/test_api.py::test_create_submission PASSED                         [ 69%]
-tests/test_api.py::test_idempotent_retry_same_payload PASSED             [ 73%]
-tests/test_api.py::test_idempotent_different_payload_rejected PASSED     [ 78%]
-tests/test_api.py::test_concurrent_duplicate_submissions PASSED          [ 82%]
-tests/test_api.py::test_get_submission_by_id PASSED                      [ 86%]
-tests/test_api.py::test_get_submission_by_key PASSED                     [ 91%]
-tests/test_api.py::test_get_revisions PASSED                             [ 95%]
-tests/test_api.py::test_metrics PASSED                                   [100%]
-============================== 23 passed in 0.60s ==============================
+### Atomic Optimistic Concurrency Control (OCC)
+FormRelay treats drafts as versioned entities with strictly monotonic revision counters (`revision: 1, 2, ... N`).
+- **Atomic Conditional Updates**: All mutating operations (`update_draft`, `sync_draft`, `resolve_conflict`) execute as atomic SQL conditional updates:
+  ```sql
+  UPDATE drafts
+  SET data = :data, revision = revision + 1, updated_at = :now
+  WHERE id = :draft_id
+    AND owner_token = :owner_token
+    AND revision = :expected_revision
+    AND status != 'submitted';
+  ```
+- **Silent Overwrite Prevention**: If two concurrent processes attempt to advance the same draft revision, the database serializes them. The transaction whose expected revision no longer matches receives `rowcount == 0`, immediately aborts the write, rolls back, and returns `HTTP 409 Conflict` with the latest server revision and server state.
+- **Atomic Revision Snapshots & Auditing**: Every successful state transition commits the updated draft, an immutable `DraftRevision` snapshot (`draft_revisions`), and a structured `AuditEvent` within the **same atomic database transaction**. Any mid-transaction failure triggers a full rollback, leaving no partial state or orphan revision snapshots.
+
+---
+
+## Security Model & Limitations of `X-Owner-Token`
+
+> [!WARNING]
+> **Demo Authentication Notice**: `X-Owner-Token` is an ephemeral session-isolation token designed exclusively for demonstration purposes. **It is not production-grade authentication.**
+
+### Known Authentication Limitations
+1. **No Cryptographic Signatures**: `X-Owner-Token` is a client-generated UUID without cryptographic signing or tamper protection.
+2. **No Expiration or Revocation**: Tokens do not support automated TTLs, sliding sessions, or revocation lists.
+3. **No Centralized Identity Provider**: Tokens are not tied to a trusted Identity Provider (IdP) or directory service.
+4. **Client-Side Storage**: In the demo, tokens are stored in browser `localStorage`. In untrusted environments, this is susceptible to XSS extraction.
+
+### Production Deployment Guidance
+When transitioning FormRelay to production:
+1. **OAuth 2.0 / OpenID Connect (OIDC)**: Replace `X-Owner-Token` with JWT bearer tokens issued by an IdP (e.g., Keycloak, Auth0, Amazon Cognito).
+2. **Token Validation**: Validate JWT digital signatures (`RS256`), issuer (`iss`), audience (`aud`), and expiration (`exp`) in FastAPI middleware on every request.
+3. **Identity-Bound Ownership**: Extract the subject identifier (`sub`) from the validated JWT claims and bind resource ownership to `user_id`.
+4. **Transport Security (TLS)**: Enforce TLS 1.3 with HTTP Strict Transport Security (`HSTS`) on all endpoints.
+5. **Secure Cookie Delivery**: If using browser cookies for session tokens, specify `HttpOnly`, `Secure`, and `SameSite=Strict`.
+
+---
+
+## Database Migrations (Alembic)
+
+FormRelay uses **Alembic** for explicit, version-controlled schema migrations. Reliance on `Base.metadata.create_all` has been removed from production startup to prevent DDL race conditions in multi-worker or containerized deployments.
+
+### Running Migrations
+```bash
+# Apply all pending migrations to head
+cd backend
+alembic upgrade head
+
+# Generate a new migration revision after model changes
+alembic revision --autogenerate -m "describe_schema_change"
+
+# Rollback the last migration
+alembic downgrade -1
 ```
 
-### Frontend (Vitest + React Testing Library): 14 Passed
+### Isolated Test Database Setup
+Tests run against an isolated SQLite test database with `poolclass=NullPool`, ensuring each test executes in an isolated environment without connection or event-loop lock leaks across asynchronous test runs. Tables are created before each test and cleanly dropped afterward.
+
+---
+
+## Reproducible Test Commands
+
+FormRelay features automated test coverage across both backend and frontend.
+
+### 1. Backend Test Suite (Pytest)
+```bash
+cd backend
+.\venv\Scripts\pytest tests/ -v
 ```
- ✓ src/test/components.test.tsx (6 tests)
- ✓ src/test/recovery.test.ts (8 tests)
-   ✓ FormRelay Diff & 3-Way Merge Engine (5)
-   ✓ FormRelay Engine & IndexedDB Recovery (3)
-============================== 14 passed in 10.84s ==============================
+**Results: 32 passed in ~3.6s**
+- Health & readiness probes (`/health`, `/ready`)
+- Draft CRUD & strict owner isolation (403 Forbidden on cross-owner access, 404 on missing drafts)
+- Optimistic concurrency control & revision conflict detection (HTTP 409)
+- 3-way merge fast-forward & disjoint field auto-merge
+- Conflict resolution against stale server revision rejection (HTTP 409)
+- Persisted draft schema migration (v1 → v2) with immutable revision snapshots
+- Effectively-once idempotent submissions with SHA-256 payload fingerprinting
+- Concurrent duplicate submissions serialization and race recovery
+- Cross-owner submission access prevention
+- Transaction rollback on mid-operation audit/db failure
+- Offline draft registration with client-assigned UUIDs followed by sync
+- Recovery following uncertain submission outcomes via idempotency key lookup
+
+### 2. Frontend Test Suite (Vitest)
+```bash
+cd frontend
+npm test
+```
+**Results: 16 passed in ~16.9s**
+- Debounced local checkpointing in IndexedDB (`<100ms`)
+- Tab reload & crash state recovery from Dexie
+- Deliberate draft discard with audit logging
+- Deterministic 3-way merge conflict analyzer
+- Side-by-side field chooser application
+- Offline edit persistence without data loss
+- Graceful handling of server-side validation errors
+- Scholarship wizard step validation and progress navigation
+
+### 3. Production Build Validation
+```bash
+# Full build
+cd frontend
+npm run build
 ```
 
 ---
 
-## Reliability & Benchmark Report
+## Failure Scenarios Covered by Integration Tests
 
-| Metric | Measurement Formula | Workload | Measured Result |
+| Scenario | Injected Failure / Condition | Expected Behavior | Automated Test |
 | :--- | :--- | :--- | :--- |
-| **Draft Recovery Success Rate** | `(Successful IDB restores) / (Total reloads)` | 50 automated crash/reload cycles | **100% (50/50)** |
-| **Duplicate Prevention Rate** | `(Identical receipts returned) / (Duplicate requests)` | Concurrent & sequential retries | **100% (0 duplicates created)** |
-| **Conflict Detection Accuracy** | `(Flagged 409 conflicts) / (Divergent revisions)` | 25 multi-field test cases | **100% (25/25 detected)** |
-| **Data Integrity After Failures** | Number of corrupted or unrecoverable drafts | Failure-injection test suite | **0 corrupted records** |
-| **Local Checkpoint Latency** | Debounced IndexedDB write time | Single-record put via Dexie | **2.8 ms (p95 < 5 ms)** |
+| **Missing Draft** | Client requests non-existent draft ID | Returns HTTP 404 Not Found | `test_missing_or_unauthorized_drafts` |
+| **Unauthorized Draft Access** | Client B requests draft owned by Client A | Returns HTTP 403 Forbidden | `test_missing_or_unauthorized_drafts` |
+| **Concurrent Revision Update** | Two clients update same draft from rev 1 | First succeeds (rev 2); second gets HTTP 409 Conflict | `test_concurrent_revision_updates_prevent_silent_overwrites` |
+| **Stale Conflict Resolution** | Client resolves conflict against rev 2, but server moved to rev 3 | Rejected with HTTP 409 Conflict | `test_conflict_resolution_against_stale_server_revision` |
+| **Cross-Owner Submission** | Client B attempts to read or submit Client A's key | Rejected with HTTP 403 Forbidden | `test_cross_owner_submission_access` |
+| **Double Draft Submission** | Client attempts to submit same draft under new key | Rejected with HTTP 422 Unprocessable Entity | `test_submitting_already_submitted_draft_with_new_key_rejected` |
+| **Mid-Transaction Failure** | Audit log / revision write fails during draft update | Transaction rolls back; draft remains at rev 1 | `test_transaction_rollback_when_operation_fails` |
+| **Offline Draft Registration** | Draft created offline with local UUID | Registered with same UUID; idempotent on duplicate retries | `test_offline_draft_registration_and_subsequent_sync` |
+| **Uncertain Submission** | Network drops after server commits submission | Querying `/by-idempotency-key/{key}` recovers receipt | `test_recovery_following_uncertain_submission_outcome` |
+| **Concurrent Submission Retries** | 5 concurrent requests with identical key & payload | 1 returns 201, 4 return 200 with identical receipt | `test_concurrent_duplicate_submissions` |
 
 ---
 
-## 5-Minute Demonstration Script
+## Known Limitations
 
-1. **Step 1: Checkpoint Survival (1 minute)**:
-   - Navigate to `http://localhost:5173`.
-   - Click **"Fill Demo Data"** to populate Step 1 through Step 4.
-   - Note the status chip: *"Saved locally (pending sync)"* and *Local rev: v2*.
-   - Refresh the browser (Ctrl+R / F5) or close the tab and re-open.
-   - **Observe:** All form fields, tabs, and recovery state restore immediately from IndexedDB.
-2. **Step 2: Offline Editing & Sync (1 minute)**:
-   - Navigate to the **Failure Lab** (`/laboratory`).
-   - Execute **Scenario 2 ("Simulate Offline Editing")**.
-   - Return to the application form; edit the applicant name. Note that local checkpoints continue saving without errors.
-   - Return to the Failure Lab and execute **Scenario 3 ("Reconnect & Synchronize")**.
-   - **Observe:** Auto-sync reconciles changes with the backend, incrementing the server revision.
-3. **Step 3: Revision Conflict & 3-Way Merge (1 minute)**:
-   - In Failure Lab, execute **Scenario 7 ("Create Revision Conflict")**.
-   - Navigate to the **Conflict Resolver** (`/conflict`).
-   - **Observe:** The 3-way merge presents local vs server versions side by side. Choose which field values to keep and click **"Confirm & Sync Resolved Version"**.
-4. **Step 4: Schema Migration (1 minute)**:
-   - Navigate to **Schema v1→v2** (`/migration`).
-   - Click **"Preview Migration"**.
-   - **Observe:** 5 new v2 fields are added with default values, 0 fields are lost, and an audit table documents the migration outcome.
-5. **Step 5: Idempotent Submission (1 minute)**:
-   - Return to Step 5 of the application form and click **"Submit Application"**.
-   - Confetti triggers and the official receipt page loads.
-   - Click **"Test Idempotent Retry Live"**.
-   - **Observe:** The server returns HTTP 200 with the exact same Receipt ID, proving effectively-once semantics.
-
----
-
-## Strong Technical Decisions to Highlight in an Interview
-
-1. **Why IndexedDB (Dexie) over localStorage**:
-   - `localStorage` is synchronous, blocks the browser UI thread on large JSON serializations, and has a strict 5MB limit. IndexedDB runs asynchronously in background storage threads with structured indexing and quota protection.
-2. **Optimistic Concurrency Control vs. Last-Write-Wins**:
-   - Last-Write-Wins (LWW) silently discards user edits when multiple devices or offline sessions update the same draft. FormRelay tracks monotonic revisions (`baseRevision`, `localRevision`, `serverRevision`) and executes field-level 3-way diffing to protect user data.
-3. **Effectively-Once Processing over "Exactly-Once" Network Claims**:
-   - In distributed systems, exactly-once delivery over the network is physically impossible due to network partitions. FormRelay delivers effectively-once processing by pairing client idempotency keys with database-enforced unique constraints and atomic transaction rollback recovery.
-4. **True Heartbeat Probing over `navigator.onLine`**:
-   - `navigator.onLine` merely checks if the device is connected to a local LAN or router (even if the router has no internet connection). FormRelay uses active HTTP `/health` probes to determine real server reachability.
-5. **Zero-Trust Owner Isolation**:
-   - Private drafts and submissions are protected by `X-Owner-Token` headers, preventing unauthorized access based solely on guessing draft UUIDs.
+1. **Single Logical User per Draft**: FormRelay is optimized for single-user offline recovery and multi-device session sync. It does not provide real-time collaborative editing (CRDT / Operational Transformation).
+2. **Authentication Scope**: The included `X-Owner-Token` provides session-level isolation for demonstration and testing. Production deployments must integrate an OIDC / OAuth2 token provider.
+3. **Browser Storage Eviction**: IndexedDB storage is managed under the browser's storage quota eviction policy. In extreme low-disk conditions, browser engines may clear unpersisted site data. FormRelay mitigates this by aggressively syncing local checkpoints to the backend whenever connectivity is present.

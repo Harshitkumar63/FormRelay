@@ -209,11 +209,13 @@ class FormRelayApiClient {
   async createDraft(
     formId: string,
     schemaVersion: number,
-    data: Record<string, unknown>
+    data: Record<string, unknown>,
+    id?: string
   ): Promise<ApiDraftResponse> {
     return this.request<ApiDraftResponse>('/api/drafts', {
       method: 'POST',
       body: JSON.stringify({
+        id,
         form_id: formId,
         schema_version: schemaVersion,
         data,
@@ -264,15 +266,30 @@ class FormRelayApiClient {
     resolutionStrategy: string,
     resolvedData: Record<string, unknown>,
     targetRevision: number,
-    schemaVersion: number
+    schemaVersion: number,
+    baseRevision = 1
   ): Promise<ApiDraftResponse> {
     return this.request<ApiDraftResponse>(`/api/drafts/${draftId}/resolve-conflict`, {
       method: 'POST',
       body: JSON.stringify({
         resolution_strategy: resolutionStrategy,
         resolved_data: resolvedData,
+        server_revision: targetRevision,
         target_revision: targetRevision,
+        base_revision: baseRevision,
         schema_version: schemaVersion,
+      }),
+    })
+  }
+
+  async migratePersistedDraft(
+    draftId: string,
+    toVersion: number
+  ): Promise<ApiDraftResponse> {
+    return this.request<ApiDraftResponse>(`/api/drafts/${draftId}/migrate`, {
+      method: 'POST',
+      body: JSON.stringify({
+        to_version: toVersion,
       }),
     })
   }

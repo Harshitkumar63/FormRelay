@@ -22,6 +22,7 @@ from app.migration import migrate_data
 from app.schemas import (
     ConflictResolution,
     DraftCreate,
+    DraftMigrateRequest,
     DraftResponse,
     DraftSyncRequest,
     DraftUpdate,
@@ -40,6 +41,7 @@ from app.services import (
     get_revisions,
     get_submission,
     get_submission_by_key,
+    migrate_draft,
     resolve_conflict,
     sync_draft,
     update_draft,
@@ -51,7 +53,16 @@ router = APIRouter()
 
 
 def _get_owner_token(x_owner_token: str = Header(..., min_length=8, max_length=64)) -> str:
-    """Extract and validate the owner token from request headers."""
+    """Extract and validate the owner token from request headers.
+
+    SECURITY NOTE:
+    X-Owner-Token is a demo authentication mechanism for session isolation.
+    Limitations:
+    - No cryptographic signature or asymmetric verification.
+    - No token expiration, revocation, or refresh flow.
+    - No binding to user identity in an external IdP.
+    Production systems must use OAuth 2.0 / OIDC JWTs with verified claims.
+    """
     return x_owner_token
 
 
@@ -62,9 +73,9 @@ def _get_owner_token(x_owner_token: str = Header(..., min_length=8, max_length=6
     "/drafts",
     response_model=DraftResponse,
     status_code=201,
-    responses={400: {"model": ErrorResponse}, 422: {"model": ErrorResponse}},
+    responses={400: {"model": ErrorResponse}, 403: {"model": ErrorResponse}, 422: {"model": ErrorResponse}},
     summary="Create a new draft",
-    description="Create a new form draft. Returns the draft with revision 1.",
+    description="Create a new form draft or idempotently register an offline-created draft.",
 )
 async def create_draft_endpoint(
     req: DraftCreate,
@@ -75,6 +86,8 @@ async def create_draft_endpoint(
     correlation_id = correlation_id_var.get()
     try:
         return await create_draft(db, req, owner_token, correlation_id)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except Exception as e:
         logger.error("create_draft_error", error=str(e))
         raise HTTPException(status_code=400, detail=str(e))
@@ -92,9 +105,12 @@ async def get_draft_endpoint(
     owner_token: str = Depends(_get_owner_token),
     db: AsyncSession = Depends(get_db),
 ):
-    draft = await get_draft(db, draft_id, owner_token)
+    try:
+        draft = await get_draft(db, draft_id, owner_token)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     if draft is None:
-        raise HTTPException(status_code=404, detail="Draft not found or access denied")
+        raise HTTPException(status_code=404, detail="Draft not found")
     return DraftResponse(
         id=draft.id,
         form_id=draft.form_id,
@@ -111,6 +127,7 @@ async def get_draft_endpoint(
     "/drafts/{draft_id}",
     response_model=DraftResponse | SyncResult,
     responses={
+        403: {"model": ErrorResponse},
         404: {"model": ErrorResponse},
         409: {"model": SyncResult},
         422: {"model": ErrorResponse},
@@ -132,8 +149,10 @@ async def update_draft_endpoint(
         if isinstance(result, SyncResult) and result.status == "validation_error":
             raise HTTPException(status_code=422, detail=result.model_dump())
         return result
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except LookupError:
-        raise HTTPException(status_code=404, detail="Draft not found or access denied")
+        raise HTTPException(status_code=404, detail="Draft not found")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -141,7 +160,7 @@ async def update_draft_endpoint(
 @router.get(
     "/drafts/{draft_id}/revisions",
     response_model=list[RevisionResponse],
-    responses={404: {"model": ErrorResponse}},
+    responses={403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
     summary="Get draft revision history",
     description="Retrieve all revisions for a draft, ordered by revision number.",
 )
@@ -152,8 +171,10 @@ async def get_revisions_endpoint(
 ):
     try:
         return await get_revisions(db, draft_id, owner_token)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except LookupError:
-        raise HTTPException(status_code=404, detail="Draft not found or access denied")
+        raise HTTPException(status_code=404, detail="Draft not found")
 
 
 # ─── Sync ──────────────────────────────────────────────────────────────
@@ -163,6 +184,7 @@ async def get_revisions_endpoint(
     "/drafts/{draft_id}/sync",
     response_model=SyncResult,
     responses={
+        403: {"model": ErrorResponse},
         404: {"model": ErrorResponse},
         409: {"model": SyncResult},
         422: {"model": SyncResult},
@@ -188,8 +210,10 @@ async def sync_draft_endpoint(
         if result.status == "validation_error":
             raise HTTPException(status_code=422, detail=result.model_dump())
         return result
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except LookupError:
-        raise HTTPException(status_code=404, detail="Draft not found or access denied")
+        raise HTTPException(status_code=404, detail="Draft not found")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -198,6 +222,7 @@ async def sync_draft_endpoint(
     "/drafts/{draft_id}/resolve-conflict",
     response_model=DraftResponse,
     responses={
+        403: {"model": ErrorResponse},
         404: {"model": ErrorResponse},
         409: {"model": ErrorResponse},
         422: {"model": ErrorResponse},
@@ -214,13 +239,44 @@ async def resolve_conflict_endpoint(
     correlation_id = correlation_id_var.get()
     try:
         return await resolve_conflict(db, draft_id, req, owner_token, correlation_id)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except LookupError:
-        raise HTTPException(status_code=404, detail="Draft not found or access denied")
+        raise HTTPException(status_code=404, detail="Draft not found")
     except ValueError as e:
         raise HTTPException(
             status_code=409 if "revision" in str(e).lower() else 422,
             detail=str(e),
         )
+
+
+@router.post(
+    "/drafts/{draft_id}/migrate",
+    response_model=DraftResponse,
+    responses={
+        403: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        422: {"model": ErrorResponse},
+    },
+    summary="Migrate persisted draft to target schema version",
+    description="Migrate a persisted draft in the database to a target schema version with a new revision snapshot.",
+)
+async def migrate_draft_endpoint(
+    draft_id: str,
+    req: DraftMigrateRequest,
+    owner_token: str = Depends(_get_owner_token),
+    db: AsyncSession = Depends(get_db),
+):
+    correlation_id = correlation_id_var.get()
+    try:
+        draft, _ = await migrate_draft(db, draft_id, req, owner_token, correlation_id)
+        return draft
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
 
 # ─── Schema Migration ─────────────────────────────────────────────────
@@ -230,7 +286,7 @@ async def resolve_conflict_endpoint(
     "/schema/migrate",
     response_model=SchemaMigrationResponse,
     summary="Migrate form data between schema versions",
-    description="Migrate draft data from one schema version to another. Returns a migration report.",
+    description="Migrate draft data from one schema version to another in-memory. Returns a migration report.",
 )
 async def migrate_schema_endpoint(req: SchemaMigrationRequest):
     try:
@@ -248,6 +304,8 @@ async def migrate_schema_endpoint(req: SchemaMigrationRequest):
     status_code=201,
     responses={
         200: {"model": SubmissionResponse, "description": "Existing submission returned (idempotent)"},
+        403: {"model": ErrorResponse, "description": "Draft or idempotency key belongs to another owner"},
+        404: {"model": ErrorResponse, "description": "Draft not found"},
         409: {"model": ErrorResponse, "description": "Same key, different payload"},
         422: {"model": ErrorResponse},
     },
@@ -270,9 +328,13 @@ async def create_submission_endpoint(
         if not is_new:
             response.status_code = 200  # Override 201 for idempotent hit
         return submission
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         error_msg = str(e)
-        if "idempotency" in error_msg.lower():
+        if "idempotency" in error_msg.lower() or "different payload" in error_msg.lower():
             raise HTTPException(status_code=409, detail=error_msg)
         raise HTTPException(status_code=422, detail=error_msg)
 
@@ -280,7 +342,7 @@ async def create_submission_endpoint(
 @router.get(
     "/submissions/{submission_id}",
     response_model=SubmissionResponse,
-    responses={404: {"model": ErrorResponse}},
+    responses={403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
     summary="Get a submission by ID",
 )
 async def get_submission_endpoint(
@@ -288,9 +350,12 @@ async def get_submission_endpoint(
     owner_token: str = Depends(_get_owner_token),
     db: AsyncSession = Depends(get_db),
 ):
-    sub = await get_submission(db, submission_id, owner_token)
+    try:
+        sub = await get_submission(db, submission_id, owner_token)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     if sub is None:
-        raise HTTPException(status_code=404, detail="Submission not found or access denied")
+        raise HTTPException(status_code=404, detail="Submission not found")
     return SubmissionResponse(
         id=sub.id,
         draft_id=sub.draft_id,
@@ -306,7 +371,7 @@ async def get_submission_endpoint(
 @router.get(
     "/submissions/by-idempotency-key/{key}",
     response_model=SubmissionResponse,
-    responses={404: {"model": ErrorResponse}},
+    responses={403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
     summary="Get a submission by idempotency key",
     description="Check submission status by idempotency key. Useful for reconciling uncertain outcomes.",
 )
@@ -315,7 +380,10 @@ async def get_submission_by_key_endpoint(
     owner_token: str = Depends(_get_owner_token),
     db: AsyncSession = Depends(get_db),
 ):
-    sub = await get_submission_by_key(db, key, owner_token)
+    try:
+        sub = await get_submission_by_key(db, key, owner_token)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     if sub is None:
         raise HTTPException(status_code=404, detail="Submission not found for this key")
     return SubmissionResponse(

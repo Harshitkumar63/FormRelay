@@ -107,6 +107,7 @@ class ErrorResponse(BaseModel):
 
 class DraftCreate(BaseModel):
     """Request to create a new draft."""
+    id: str | None = Field(default=None, max_length=36, description="Optional client-assigned draft ID for offline creation")
     form_id: str = Field(max_length=100)
     schema_version: int = Field(default=CURRENT_SCHEMA_VERSION, ge=1, le=2)
     data: dict = Field(default_factory=dict)
@@ -117,6 +118,11 @@ class DraftUpdate(BaseModel):
     data: dict
     expected_revision: int = Field(ge=1, description="Client's expected server revision for OCC")
     schema_version: int = Field(ge=1, le=2)
+
+
+class DraftMigrateRequest(BaseModel):
+    """Request to migrate a persisted draft to a target schema version."""
+    to_version: int = Field(default=CURRENT_SCHEMA_VERSION, ge=1, le=2)
 
 
 class DraftResponse(BaseModel):
@@ -152,9 +158,18 @@ class SyncResult(BaseModel):
 class ConflictResolution(BaseModel):
     """Client's resolution of a conflict."""
     resolved_data: dict
-    base_revision: int = Field(ge=1)
-    server_revision: int = Field(ge=1)
+    base_revision: int = Field(default=1, ge=1)
+    server_revision: int | None = Field(default=None, ge=1)
+    target_revision: int | None = Field(default=None, ge=1)
     schema_version: int = Field(ge=1, le=2)
+
+    @property
+    def effective_server_revision(self) -> int:
+        if self.server_revision is not None:
+            return self.server_revision
+        if self.target_revision is not None:
+            return self.target_revision
+        return self.base_revision
 
 
 class RevisionResponse(BaseModel):
