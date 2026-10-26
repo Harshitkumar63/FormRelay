@@ -6,7 +6,6 @@ import {
   applyResolutions,
   flattenObject,
   unflattenObject,
-  areValuesEqual,
 } from '../recovery/diff'
 import { DEFAULT_V2_SCHOLARSHIP_DATA, SAMPLE_POPULATED_SCHOLARSHIP } from '../recovery/defaults'
 
@@ -177,12 +176,12 @@ describe('FormRelay Engine & IndexedDB Recovery', () => {
     // Verify local storage has the edited data and incremented revision
     const stored = await db.drafts.get(originalLocalId)
     expect(stored).toBeDefined()
-    expect((stored?.data as any).personal.first_name).toBe('OfflineElena')
+    expect((stored!.data as any).personal.first_name).toBe('OfflineElena')
     expect(stored?.localRevision).toBe(2)
   })
 
   it('handles server-side validation error gracefully without corrupting local draft', async () => {
-    const draft = await engine.loadOrCreateDraft(
+    await engine.loadOrCreateDraft(
       'validation-error-form',
       2,
       DEFAULT_V2_SCHOLARSHIP_DATA as unknown as Record<string, unknown>
@@ -199,6 +198,6 @@ describe('FormRelay Engine & IndexedDB Recovery', () => {
     // Local checkpoint remains intact even if sync encounters validation error
     const local = engine.getDraft()
     expect(local).toBeDefined()
-    expect((local?.data as any).contact.email).toBe('not-an-email')
+    expect((local!.data as any).contact.email).toBe('not-an-email')
   })
 })

@@ -1,12 +1,11 @@
 import { describe, it, expect, beforeEach } from 'vitest'
+import '@testing-library/jest-dom/vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { BrowserRouter } from 'react-router-dom'
 import { StatusBanner } from '../components/common/StatusBanner'
 import { Navbar } from '../components/layout/Navbar'
 import { ScholarshipWizard } from '../components/scholarship/ScholarshipWizard'
-import { ConflictResolver } from '../components/conflict/ConflictResolver'
 import { SchemaMigrator } from '../components/migration/SchemaMigrator'
-import { SubmissionReceipt } from '../components/receipt/SubmissionReceipt'
 import { db } from '../recovery/db'
 import type { LocalDraftRecord } from '../recovery/types'
 
